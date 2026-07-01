@@ -1,204 +1,218 @@
-#include <Arduino.h>
+/* * ESP32-CAM: Standalone Edge Impulse AI + Direct Firebase Image Upload
+ * *** DIAGNOSTICS & BASE64 UPLOAD MODE (WITH RESIZE FIX) ***
+ */
 
-// ==========================================
-// 1. PIN DEFINITIONS
-// ==========================================
-const int ENA_PIN = 19; 
-const int IN1_PIN = 21; 
-const int IN2_PIN = 18; 
-const int ENB_PIN = 4;  
-const int IN3_PIN = 27; // Ensure this is 27 as per your board
-const int IN4_PIN = 2;  
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include "mbedtls/base64.h" // Built-in ESP32 library for Base64 encoding
 
-const int FRONT_TRIG = 13; 
-const int FRONT_ECHO = 12;
-const int SIDE_TRIG = 32;
-const int SIDE_ECHO = 35; // Left side sensor
+// IMPORTANT: Make sure this matches your downloaded Edge Impulse library!
+#include <esp_inferencing.h> 
+#include "edge-impulse-sdk/dsp/image/image.hpp"
+#include "esp_camera.h"
 
-// ==========================================
-// 2. PWM & THRESHOLDS (11.1V Setup)
-// ==========================================
-const int freq = 1000;           
-const int resolution = 8;        
-const int BASE_SPEED = 120;      
-const int TURN_SPEED = 220;      // INCREASED: Much higher for aggressive pivoting      
-const int FRONT_STOP_DIST = 20;  
-const int SIDE_TARGET_DIST = 15; 
+// --- WI-FI & FIREBASE SETTINGS ---
+const char* ssid = "T3-19-07"; 
+const char* password = "memo_23670";
+const char* firebaseUrl = "https://safehouse-rover-default-rtdb.asia-southeast1.firebasedatabase.app/robots/camera_alert.json"; 
 
-// ==========================================
-// 3. STATE MACHINE
-// ==========================================
-enum RobotState {
-  STATE_KICKSTART,        
-  STATE_PATROL,           
-  STATE_WRAP_REVERSE,     
-  STATE_WRAP_FORWARD,     
-  STATE_HUNT_LEFT,        
-  STATE_EVADE_STOP_1,     
-  STATE_EVADE_BACKUP,     
-  STATE_EVADE_PIVOT,      
-  STATE_EVADE_STOP_2
-};
+// --- AI THINKER PINS ---
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
 
-RobotState currentState = STATE_KICKSTART; 
-unsigned long actionStartTime = 0;
-unsigned long patrolStartTime = 0;
-bool patrolFinished = false;
+// --- GLOBALS ---
+camera_fb_t *locked_fb = NULL; 
 
-// Helper prototypes
-long getDistance(int trigPin, int echoPin);
-void moveForward(int sL, int sR);
-void moveBackward(int sL, int sR);
-void stopMotors();
+// Edge Impulse config
+#define EI_CAMERA_RAW_FRAME_BUFFER_COLS           320
+#define EI_CAMERA_RAW_FRAME_BUFFER_ROWS           240
+#define EI_CAMERA_FRAME_BYTE_SIZE                 3
+uint8_t *snapshot_buf;
 
 void setup() {
-  Serial.begin(115200);
-  pinMode(IN1_PIN, OUTPUT); pinMode(IN2_PIN, OUTPUT);
-  pinMode(IN3_PIN, OUTPUT); pinMode(IN4_PIN, OUTPUT);
-  ledcAttach(ENA_PIN, freq, resolution);
-  ledcAttach(ENB_PIN, freq, resolution);
-  pinMode(FRONT_TRIG, OUTPUT); pinMode(FRONT_ECHO, INPUT);
-  pinMode(SIDE_TRIG, OUTPUT); pinMode(SIDE_ECHO, INPUT);
+  Serial.begin(115200); 
+  Serial.println("\n--- Initializing ESP32-CAM (Base64 Upload Mode) ---");
+
+  // 1. Connect to Wi-Fi
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to Wi-Fi");
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  Serial.print("\nWi-Fi Connected! IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  // 2. Init Camera
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM; config.pin_d1 = Y3_GPIO_NUM; config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM; config.pin_d4 = Y6_GPIO_NUM; config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM; config.pin_d7 = Y9_GPIO_NUM; config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM; config.pin_vsync = VSYNC_GPIO_NUM; config.pin_href = HREF_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM; config.pin_sccb_scl = SIOC_GPIO_NUM; config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.frame_size = FRAMESIZE_QVGA; 
+  config.jpeg_quality = 12; // Do not lower this number (lower number = larger file size!)
+  config.fb_count = 1;
+  config.fb_location = CAMERA_FB_IN_PSRAM;
   
-  delay(10000); 
-  patrolStartTime = millis(); 
-  actionStartTime = millis(); 
+  if (esp_camera_init(&config) != ESP_OK) {
+    Serial.println("Camera Init Failed! Check pins/power.");
+    while(true); 
+  }
+  
+  Serial.println("System Ready.");
 }
 
 void loop() {
-  // Global Timer
-  if (millis() - patrolStartTime >= 60000) {
-    if (!patrolFinished) { stopMotors(); patrolFinished = true; }
+  Serial.println("\n=========================================");
+  Serial.println("Waiting 10 seconds before next capture...");
+  delay(10000); 
+
+  Serial.println("Snapping photo...");
+
+  // 1. Capture the image
+  locked_fb = esp_camera_fb_get();
+  if (!locked_fb) {
+    Serial.println("Camera capture failed!");
     return;
   }
 
-  // --- SAFETY INTERCEPT: CRASH PREVENTION ---
-  long frontDist = getDistance(FRONT_TRIG, FRONT_ECHO);
-  if (frontDist > 0 && frontDist <= FRONT_STOP_DIST && currentState != STATE_EVADE_STOP_1) {
-    stopMotors();
-    currentState = STATE_EVADE_STOP_1;
-    actionStartTime = millis();
+  // 2. Allocate memory for AI
+  snapshot_buf = (uint8_t*)malloc(EI_CAMERA_RAW_FRAME_BUFFER_COLS * EI_CAMERA_RAW_FRAME_BUFFER_ROWS * EI_CAMERA_FRAME_BYTE_SIZE);
+  if(snapshot_buf == nullptr) {
+      Serial.println("Failed to allocate RAM for AI.");
+      esp_camera_fb_return(locked_fb);
+      return;
+  }
+  
+  // Convert JPEG to raw RGB
+  fmt2rgb888(locked_fb->buf, locked_fb->len, PIXFORMAT_JPEG, snapshot_buf);
+
+  // >>> THE MISSING RESIZE FIX <<<
+  // Shrink the 320x240 image down to fit the AI model's required size
+  if ((EI_CLASSIFIER_INPUT_WIDTH != EI_CAMERA_RAW_FRAME_BUFFER_COLS) || 
+      (EI_CLASSIFIER_INPUT_HEIGHT != EI_CAMERA_RAW_FRAME_BUFFER_ROWS)) {
+      
+      ei::image::processing::crop_and_interpolate_rgb888(
+        snapshot_buf,
+        EI_CAMERA_RAW_FRAME_BUFFER_COLS,
+        EI_CAMERA_RAW_FRAME_BUFFER_ROWS,
+        snapshot_buf,
+        EI_CLASSIFIER_INPUT_WIDTH,
+        EI_CLASSIFIER_INPUT_HEIGHT);
   }
 
-  switch (currentState) {
-    case STATE_KICKSTART:
-      moveForward(250, 250); 
-      if (millis() - actionStartTime >= 75) currentState = STATE_PATROL;
-      break;
+  // 3. Run the AI Model
+  Serial.println("Running AI Analysis...");
+  ei::signal_t signal;
+  signal.total_length = EI_CLASSIFIER_INPUT_WIDTH * EI_CLASSIFIER_INPUT_HEIGHT;
+  signal.get_data = &ei_camera_get_data;
+  ei_impulse_result_t result = { 0 };
+  run_classifier(&signal, &result, false);
 
-    // =========================================================
-    // STATE: NORMAL PATROL
-    // =========================================================
-    case STATE_PATROL: {
-      long sideDist = getDistance(SIDE_TRIG, SIDE_ECHO);
-      
-      // Wall lost: Hit a corner (room corner or box corner)
-      if (sideDist >= 40 || sideDist == 999) {
-        currentState = STATE_WRAP_REVERSE;
-        actionStartTime = millis();
-      } else {
-        // Standard wall following
-        if (sideDist < (SIDE_TARGET_DIST - 3)) moveForward(BASE_SPEED, 80);
-        else if (sideDist > (SIDE_TARGET_DIST + 5)) moveForward(80, BASE_SPEED);
-        else moveForward(BASE_SPEED, BASE_SPEED);
+  // 4. Analyze Results 
+  String bestLabel = "none";
+  float bestScore = 0.0;
+  
+  #if EI_CLASSIFIER_OBJECT_DETECTION == 1
+    for (uint32_t i = 0; i < result.bounding_boxes_count; i++) {
+      if (result.bounding_boxes[i].value > bestScore) {
+        bestLabel = String(result.bounding_boxes[i].label);
+        bestScore = result.bounding_boxes[i].value;
       }
-      break;
+    }
+  #else
+    for (uint16_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+      if (result.classification[i].value > bestScore) {
+        bestLabel = String(ei_classifier_inferencing_categories[i]);
+        bestScore = result.classification[i].value;
+      }
+    }
+  #endif
+
+  // Print results to Serial for debugging
+  Serial.print("Top Prediction: ");
+  Serial.print(bestLabel);
+  Serial.print(" (");
+  Serial.print(bestScore * 100);
+  Serial.println("%)");
+
+  // 5. CRITICAL: Free AI Memory immediately to make room for Base64 Conversion
+  free(snapshot_buf); 
+
+  // 6. Direct Firebase Upload
+  Serial.println("AI finished. Encoding image to Base64 and uploading to Firebase...");
+  uploadImageToFirebase(bestLabel, bestScore, locked_fb);
+
+  // 7. Cleanup Memory
+  esp_camera_fb_return(locked_fb); 
+  locked_fb = NULL;
+}
+
+// --- HELPER FUNCTIONS ---
+int ei_camera_get_data(size_t offset, size_t length, float *out_ptr) {
+    size_t pixel_ix = offset * 3;
+    size_t pixels_left = length;
+    size_t out_ptr_ix = 0;
+    while (pixels_left != 0) {
+        out_ptr[out_ptr_ix] = (snapshot_buf[pixel_ix + 2] << 16) + (snapshot_buf[pixel_ix + 1] << 8) + snapshot_buf[pixel_ix];
+        out_ptr_ix++; pixel_ix+=3; pixels_left--;
+    }
+    return 0;
+}
+
+void uploadImageToFirebase(String type, float confidence, camera_fb_t *fb) {
+  if(WiFi.status() == WL_CONNECTED){
+    
+    // 1. Calculate Base64 size and allocate memory safely
+    size_t output_len;
+    size_t encoded_len = ((fb->len + 2) / 3) * 4 + 1; // Formula for Base64 length
+    unsigned char * base64_buf = (unsigned char *) malloc(encoded_len);
+    
+    if(base64_buf == NULL) {
+      Serial.println("ERROR: Out of Memory for Base64 encoding!");
+      return;
     }
 
-    // =========================================================
-    // STATES: THE 3-PART WRAP & HUNT MANEUVER
-    // =========================================================
-    case STATE_WRAP_REVERSE:
-      // Snap backward/right to clear the back wheels
-      moveBackward(40, 190); 
-      
-      // INCREASED: Now holds the reverse hook for 650ms
-      if (millis() - actionStartTime >= 650) { 
-        currentState = STATE_WRAP_FORWARD;
-        actionStartTime = millis();
-      }
-      break;
+    // 2. Encode the raw JPEG array into a Base64 String
+    mbedtls_base64_encode(base64_buf, encoded_len, &output_len, fb->buf, fb->len);
+    String imageString = String((char*)base64_buf);
+    
+    // Free the buffer now that we have the String
+    free(base64_buf); 
 
-    case STATE_WRAP_FORWARD:
-      // TIGHT Blind curve left to round the physical corner
-      moveForward(50, BASE_SPEED);
-      
-      // INCREASED: Commits to the blind curve for 900ms before checking the sensor
-      if (millis() - actionStartTime >= 900) {
-        currentState = STATE_HUNT_LEFT; 
-      }
-      break;
-
-    case STATE_HUNT_LEFT: {
-      // Continuously carve a tight left circle...
-      moveForward(50, BASE_SPEED);
-      
-      // ...until the side sensor finally sees the new wall/side of the box
-      long sideDist = getDistance(SIDE_TRIG, SIDE_ECHO);
-      if (sideDist > 0 && sideDist < 35) {
-        Serial.println("Found the wall again! Resuming patrol.");
-        currentState = STATE_PATROL; 
-      }
-      delay(50); // Small delay for sensor stability while hunting
-      break;
-    }
-
-    // =========================================================
-    // STATES: EVASION SEQUENCE (Wall is on LEFT, evade RIGHT)
-    // =========================================================
-    case STATE_EVADE_STOP_1:
-      if (millis() - actionStartTime >= 500) {
-        moveBackward(BASE_SPEED, BASE_SPEED);
-        currentState = STATE_EVADE_BACKUP;
-        actionStartTime = millis();
-      }
-      break;
-
-    case STATE_EVADE_BACKUP:
-      if (millis() - actionStartTime >= 600) {
-        // Pivot Right away from the left wall (Now using the much higher TURN_SPEED)
-        digitalWrite(IN1_PIN, HIGH); digitalWrite(IN2_PIN, LOW);
-        digitalWrite(IN3_PIN, LOW); digitalWrite(IN4_PIN, HIGH);
-        ledcWrite(ENA_PIN, TURN_SPEED); ledcWrite(ENB_PIN, TURN_SPEED);
-        currentState = STATE_EVADE_PIVOT;
-        actionStartTime = millis();
-      }
-      break;
-
-    case STATE_EVADE_PIVOT:
-      if (millis() - actionStartTime >= 500) {
-        stopMotors();
-        currentState = STATE_KICKSTART;
-      }
-      break;
+    // 3. Connect to Firebase
+    HTTPClient http;
+    http.begin(firebaseUrl);
+    http.addHeader("Content-Type", "application/json");
+    
+    // 4. Construct JSON Payload (This will be massive!)
+    String payload = "{\"status\":\"debug_test\", \"type\":\"" + type + "\", \"confidence\":" + String(confidence * 100, 2) + ", \"image_data\":\"" + imageString + "\"}";
+    
+    // 5. Upload via PATCH
+    int httpResponseCode = http.PATCH(payload); 
+    
+    Serial.print("Firebase Update Response Code: ");
+    Serial.println(httpResponseCode); // 200 = Success
+    http.end();
+    
+  } else {
+    Serial.println("Error: Wi-Fi disconnected during Firebase update.");
   }
-}
-
-// ==========================================
-// HELPER FUNCTIONS
-// ==========================================
-long getDistance(int trigPin, int echoPin) {
-  digitalWrite(trigPin, LOW); delayMicroseconds(2);
-  digitalWrite(trigPin, HIGH); delayMicroseconds(10);
-  digitalWrite(trigPin, LOW);
-  long d = pulseIn(echoPin, HIGH, 20000);
-  return (d == 0) ? 999 : (d * 0.034 / 2);
-}
-
-void moveForward(int sL, int sR) {
-  digitalWrite(IN1_PIN, HIGH); digitalWrite(IN2_PIN, LOW);
-  digitalWrite(IN3_PIN, HIGH); digitalWrite(IN4_PIN, LOW);
-  ledcWrite(ENA_PIN, sL); ledcWrite(ENB_PIN, sR);
-}
-
-void moveBackward(int sL, int sR) {
-  digitalWrite(IN1_PIN, LOW); digitalWrite(IN2_PIN, HIGH);
-  digitalWrite(IN3_PIN, LOW); digitalWrite(IN4_PIN, HIGH);
-  ledcWrite(ENA_PIN, sL); ledcWrite(ENB_PIN, sR);
-}
-
-void stopMotors() {
-  digitalWrite(IN1_PIN, LOW); digitalWrite(IN2_PIN, LOW);
-  digitalWrite(IN3_PIN, LOW); digitalWrite(IN4_PIN, LOW);
-  ledcWrite(ENA_PIN, 0); ledcWrite(ENB_PIN, 0);
 }
