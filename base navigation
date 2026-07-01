@@ -1,0 +1,314 @@
+// ==================================================
+// ESP32 Wall Following Robot
+// Left Ultrasonic = wall following
+// Front Ultrasonic = obstacle avoidance
+// ==================================================
+
+// ---------------- Motor A Pins ----------------
+#define ENA 19
+#define IN1 5
+#define IN2 2
+
+// ---------------- Motor B Pins ----------------
+#define ENB 4
+#define IN3 21
+#define IN4 18
+
+// ---------------- Left / Side Ultrasonic ----------------
+#define SIDE_TRIG 32
+#define SIDE_ECHO 35
+
+// ---------------- Front Ultrasonic ----------------
+#define FRONT_TRIG 13
+#define FRONT_ECHO 12
+
+// ---------------- Settings ----------------
+#define TARGET_DISTANCE 6      // Ideal distance from wall in cm
+#define MIN_DISTANCE 5         // Too close to wall
+#define MAX_DISTANCE 7         // Too far from wall
+#define CORNER_DISTANCE 20     // If side distance > 20cm, there is no wall = corner
+#define FRONT_OBSTACLE 15      // Obstacle in front if less than 15cm
+
+// Motor speed
+#define BASE_SPEED 135         // Medium speed
+#define SLOW_SPEED 110
+#define TURN_SPEED 135
+
+// Timing
+#define LEFT_90_TIME 520       // Adjust this for real 90 degree left turn
+#define RIGHT_TURN_TIME 420
+#define SMALL_ADJUST_TIME 70
+#define FORWARD_AFTER_TURN 250
+
+// ==================================================
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(ENA, OUTPUT);
+
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  pinMode(ENB, OUTPUT);
+
+  pinMode(SIDE_TRIG, OUTPUT);
+  pinMode(SIDE_ECHO, INPUT);
+
+  pinMode(FRONT_TRIG, OUTPUT);
+  pinMode(FRONT_ECHO, INPUT);
+
+  stopRobot();
+  delay(1000);
+}
+
+// ==================================================
+
+void loop() {
+  int sideDistance = readUltrasonic(SIDE_TRIG, SIDE_ECHO);
+  int frontDistance = readUltrasonic(FRONT_TRIG, FRONT_ECHO);
+
+  Serial.print("Side: ");
+  Serial.print(sideDistance);
+  Serial.print(" cm | Front: ");
+  Serial.print(frontDistance);
+  Serial.println(" cm");
+
+  // 1) Front obstacle avoidance
+  if (frontDistance > 0 && frontDistance < FRONT_OBSTACLE) {
+    avoidFrontObstacle();
+    return;
+  }
+
+  // 2) Corner detection
+  // If left sensor sees more than 20 cm, it means wall ended, so turn left
+  if (sideDistance > CORNER_DISTANCE || sideDistance == 0) {
+    turnLeft90();
+    return;
+  }
+
+  // 3) Wall following control
+  if (sideDistance < MIN_DISTANCE) {
+    // Too close to wall, move slightly right
+    slightRight();
+  }
+  else if (sideDistance > MAX_DISTANCE && sideDistance <= CORNER_DISTANCE) {
+    // Too far from wall, move slightly left
+    slightLeft();
+  }
+  else {
+    // Good distance 5-7 cm
+    moveForward(BASE_SPEED);
+  }
+
+  delay(40);
+}
+
+// ==================================================
+// Ultrasonic Reading Function
+// ==================================================
+
+int readUltrasonic(int trigPin, int echoPin) {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(3);
+
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  long duration = pulseIn(echoPin, HIGH, 25000); // timeout 25ms
+
+  if (duration == 0) {
+    return 0; // no reading
+  }
+
+  int distance = duration * 0.034 / 2;
+
+  // Ignore wrong big values
+  if (distance > 300) {
+    return 0;
+  }
+
+  return distance;
+}
+
+// ==================================================
+// Movement Functions
+// ==================================================
+
+void moveForward(int speedValue) {
+  // Motor A forward
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+
+  // Motor B forward
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+
+  analogWrite(ENA, speedValue);
+  analogWrite(ENB, speedValue);
+}
+
+void moveBackward(int speedValue) {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+
+  analogWrite(ENA, speedValue);
+  analogWrite(ENB, speedValue);
+}
+
+void stopRobot() {
+  analogWrite(ENA, 0);
+  analogWrite(ENB, 0);
+
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+}
+
+// ==================================================
+// Smooth Wall Following Adjustments
+// ==================================================
+
+void slightLeft() {
+  // Left turn correction while moving
+  // Motor A slower, Motor B faster
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+
+  analogWrite(ENA, SLOW_SPEED);
+  analogWrite(ENB, BASE_SPEED + 20);
+
+  delay(SMALL_ADJUST_TIME);
+}
+
+void slightRight() {
+  // Right turn correction while moving
+  // Motor A faster, Motor B slower
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+
+  analogWrite(ENA, BASE_SPEED + 20);
+  analogWrite(ENB, SLOW_SPEED);
+
+  delay(SMALL_ADJUST_TIME);
+}
+
+// ==================================================
+// 90 Degree Corner Turn
+// ==================================================
+
+void turnLeft90() {
+  stopRobot();
+  delay(120);
+
+  // Turn left in place
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+
+  analogWrite(ENA, TURN_SPEED);
+  analogWrite(ENB, TURN_SPEED);
+
+  delay(LEFT_90_TIME);
+
+  stopRobot();
+  delay(100);
+
+  moveForward(BASE_SPEED);
+  delay(FORWARD_AFTER_TURN);
+}
+
+// ==================================================
+// Obstacle Avoidance
+// ==================================================
+
+void avoidFrontObstacle() {
+  stopRobot();
+  delay(150);
+
+  // Step 1: Turn right to avoid the obstacle
+  turnRightSmall();
+
+  // Step 2: Move forward a little
+  moveForward(BASE_SPEED);
+  delay(450);
+
+  // Step 3: Turn left again to return near the wall direction
+  turnLeftSmall();
+
+  // Step 4: Move forward slowly until side sensor detects wall again
+  unsigned long startTime = millis();
+
+  while (millis() - startTime < 2500) {
+    int sideDistance = readUltrasonic(SIDE_TRIG, SIDE_ECHO);
+    int frontDistance = readUltrasonic(FRONT_TRIG, FRONT_ECHO);
+
+    if (frontDistance > 0 && frontDistance < FRONT_OBSTACLE) {
+      stopRobot();
+      delay(100);
+      turnRightSmall();
+    }
+
+    if (sideDistance >= MIN_DISTANCE && sideDistance <= MAX_DISTANCE) {
+      break;
+    }
+
+    if (sideDistance > MAX_DISTANCE || sideDistance == 0) {
+      slightLeft();
+    } else if (sideDistance < MIN_DISTANCE) {
+      slightRight();
+    } else {
+      moveForward(SLOW_SPEED);
+    }
+  }
+}
+
+// ==================================================
+// Small Turns for Obstacle Avoidance
+// ==================================================
+
+void turnRightSmall() {
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+
+  analogWrite(ENA, TURN_SPEED);
+  analogWrite(ENB, TURN_SPEED);
+
+  delay(RIGHT_TURN_TIME);
+
+  stopRobot();
+  delay(100);
+}
+
+void turnLeftSmall() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+
+  analogWrite(ENA, TURN_SPEED);
+  analogWrite(ENB, TURN_SPEED);
+
+  delay(RIGHT_TURN_TIME);
+
+  stopRobot();
+  delay(100);
+}
