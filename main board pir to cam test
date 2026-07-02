@@ -1,0 +1,64 @@
+#include <HardwareSerial.h>
+#include <ESP32Servo.h>
+
+// --- PIN MAPPING ---
+// Replace these numbers with the exact GPIO numbers your layout uses
+const int PIR_PIN = 13;       // Labeled as PIR_SIGNAL
+const int SERVO_PIN = 12;     // Labeled as SERVO_SIGNAL
+
+const int MAIN_TX_PIN = 17;   // Connects to CAM_RX
+const int MAIN_RX_PIN = 16;   // Connects to CAM_TX
+
+// Define Serial2 for hardwired communication with the camera
+HardwareSerial camSerial(2); 
+Servo cameraServo;
+
+void setup() {
+  // Initialize USB Serial for debugging on your PC
+  Serial.begin(115200); 
+  
+  // Initialize the hardwired UART connection to the ESP32-CAM at 115200 baud
+  camSerial.begin(115200, SERIAL_8N1, MAIN_RX_PIN, MAIN_TX_PIN);
+
+  // Configure PIR pin as input
+ pinMode(PIR_PIN, INPUT_PULLDOWN);
+
+  // Configure and initialize the Servo motor
+  cameraServo.attach(SERVO_PIN, 500, 2400); 
+  cameraServo.write(0); // Start at home position (0 degrees)
+  
+  Serial.println("--- Main Board Initialized ---");
+  Serial.println("Looking for motion on PIR_SIGNAL...");
+}
+
+void loop() {
+  // Read the status of the single PIR sensor
+  bool motionDetected = digitalRead(PIR_PIN) == HIGH;
+
+  if (motionDetected) {
+    Serial.println("\n[MAIN] >>> MOTION DETECTED! <<<");
+    
+    // 1. Turn the servo to target position (e.g., 90 degrees)
+    Serial.println("[MAIN] Pan-adjusting camera to 90 degrees...");
+    cameraServo.write(90);
+    
+    // 2. Wait exactly 2 seconds for mechanical stabilization
+    Serial.println("[MAIN] Waiting 2 seconds for servo to settle...");
+    delay(2000); 
+    
+    // 3. Send the serial execution command over the copper trace
+    Serial.println("[MAIN] Sending 'TAKE_PIC' command via hardware serial...");
+    camSerial.println("TAKE_PIC"); 
+    
+    // 4. Cooldown window to allow image processing and prevent rapid re-triggering
+    Serial.println("[MAIN] Entering 10-second capture cooldown...");
+    delay(6000); 
+    
+    // 5. Reset camera position back to center
+    Serial.println("[MAIN] Returning camera to home position (0 degrees).");
+    cameraServo.write(0);
+    delay(1000); // Small pause for the mechanical reset
+    
+    Serial.println("--- Standby Mode: Listening for next trigger ---");
+  }
+}
