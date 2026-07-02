@@ -101,6 +101,16 @@ void setup() {
     Serial.println("Camera Init Failed! Check pins/power.");
     while(true); 
   }
+
+  // 1b. FIX UPSIDE-DOWN IMAGE
+  // The OV2640 sensor on AI-Thinker boards is often mounted rotated 180°.
+  // Flip vertically (and mirror horizontally) to correct orientation.
+  sensor_t * s = esp_camera_sensor_get();
+  if (s != NULL) {
+    s->set_vflip(s, 1);     // 1 = flip image vertically
+    s->set_hmirror(s, 1);   // 1 = mirror image horizontally (set to 0 if it looks wrong)
+    Serial.println("[CAM] Applied vflip + hmirror to correct orientation.");
+  }
   
   // 2. Boot into listening mode
   start_esp_now_mode();
