@@ -1,0 +1,74 @@
+#include <HardwareSerial.h>
+#include <ESP32Servo.h>
+
+// --- PIN MAPPING ---
+const int PIR_PIN = 33;       
+const int SERVO_PIN = 27;     
+
+const int MAIN_TX_PIN = 17;   // Connects to CAM_RX (GPIO 12)
+const int MAIN_RX_PIN = 16;   // Connects to CAM_TX (GPIO 13)
+
+HardwareSerial camSerial(2); 
+Servo cameraServo;
+
+// --- THE SMART DELAY ---
+// This replaces standard delay(). It pauses the code, but constantly 
+// watches the camera's TX line so we never miss an error message.
+void smartDelay(unsigned long waitTime) {
+  unsigned long start = millis();
+  while (millis() - start < waitTime) {
+    if (camSerial.available()) {
+      Serial.write(camSerial.read());
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200); 
+  camSerial.begin(115200, SERIAL_8N1, MAIN_RX_PIN, MAIN_TX_PIN);
+
+  pinMode(PIR_PIN, INPUT);
+
+  cameraServo.attach(SERVO_PIN, 500, 2400); 
+  cameraServo.write(0); 
+  
+  Serial.println("--- Main Board Initialized ---");
+  Serial.println("Looking for motion AND listening to Camera...");
+}
+
+void loop() {
+  // 1. ALWAYS LISTEN TO THE CAMERA (The Serial Bridge)
+  // If the camera says anything while we are in standby, print it.
+  if (camSerial.available()) {
+    Serial.write(camSerial.read());
+  }
+
+  // 2. THE ROBOT SEQUENCE
+  if (digitalRead(PIR_PIN) == HIGH) {
+      
+    Serial.println("\n[MAIN] >>> MOTION DETECTED! <<<");
+    
+    Serial.println("[MAIN] Pan-adjusting camera to 90 degrees...");
+    cameraServo.write(90);
+    
+    Serial.println("[MAIN] Stabilizing camera...");
+    smartDelay(1000); // Replaced delay()
+    
+    Serial.println("[MAIN] Sending 'TAKE_PIC' command via hardware serial...");
+    camSerial.println("TAKE_PIC"); 
+    
+    Serial.println("[MAIN] Holding position for 5 seconds (Listening to CAM logs)...");
+    smartDelay(5000); // Replaced delay() - You will see the Wi-Fi/Firebase logs here!
+    
+    Serial.println("[MAIN] Returning camera to home position (0 degrees).");
+    cameraServo.write(0);
+    smartDelay(1000); // Replaced delay()
+    
+    Serial.println("[MAIN] Waiting for PIR sensor to clear...");
+    while (digitalRead(PIR_PIN) == HIGH) {
+      smartDelay(100); // Replaced delay()
+    }
+    
+    Serial.println("\n--- Standby Mode: Listening for next trigger ---");
+  }
+}
